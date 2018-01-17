@@ -1,0 +1,10 @@
+*.o
+*.d
+*.a
+*.elf
+
+*.swp
+*.swo
+*.swn
+
+openocd.cfg
