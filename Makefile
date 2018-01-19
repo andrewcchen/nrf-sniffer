@@ -1,19 +1,20 @@
 TARGET ?= nrf51
 
 INCLUDE_DIRS := -Iinclude
+OBJS := $(patsubst %.c,%.o,$(wildcard src/*.c))
 
 ifeq ($(TARGET), nrf51)
 ARCH_FLAGS := -mthumb -mcpu=cortex-m0 -mfloat-abi=soft
 LD_LIBS := -Lsrc/nrf51 -Tnrf51.ld
-DEFS := -DNRF51=1
-OBJS := src/nrf51/system_nrf51.o src/nrf51/gcc_startup_nrf51.S.o
+DEFS += -DNRF51=1
+OBJS += src/nrf51/system_nrf51.o src/nrf51/gcc_startup_nrf51.S.o
 endif
 
 ifeq ($(TARGET), nrf52)
 ARCH_FLAGS := -mthumb -mcpu=cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16
 LD_LIBS := -Lsrc/nrf52 -Tnrf52.ld
-DEFS := -DNRF52=1
-OBJS := src/nrf52/system_nrf52.o src/nrf52/gcc_startup_nrf52.S.o
+DEFS += -DNRF52=1
+OBJS += src/nrf52/system_nrf52.o src/nrf52/gcc_startup_nrf52.S.o
 endif
 
 PREFIX ?= arm-none-eabi
@@ -26,7 +27,7 @@ AS := $(PREFIX)-as
 OBJCOPY := $(PREFIX)-objcopy
 OBJDUMP := $(PREFIX)-objdump
 
-CFLAGS ?= -g -O
+CFLAGS ?= -g -O2
 CFLAGS := -Wall -Wextra -Wmissing-prototypes -Wstrict-prototypes -fno-common $(ARCH_FLAGS) $(CFLAGS)
 CPPFLAGS := -MD $(INCLUDE_DIRS) $(DEFS) $(CPPFLAGS)
 LDFLAGS := --static $(LD_LIBS) $(ARCH_FLAGS) $(LDFLAGS)
@@ -46,11 +47,11 @@ endif
 	@printf "  CC      $(*).c\n"
 	$(Q)$(CC) $(CFLAGS) $(CPPFLAGS) $(ARCH_FLAGS) -o $(*).o -c $(*).c
 
-%.elf: src/%.o $(OBJS)
-	@printf "  LD      $(*).elf\n"
-	$(Q)$(LD) $(LDFLAGS) $(^) -o $(*).elf
+nrf-sniffer.elf: $(OBJS)
+	@printf "  LD      $(@)\n"
+	$(Q)$(LD) $(LDFLAGS) $(^) -o $(@)
 
-all: advmon.elf
+all: nrf-sniffer.elf
 
 clean:
 	@printf "  CLEAN\n"
