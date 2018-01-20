@@ -61,3 +61,5 @@ clean:
 
 .PHONY: all clean
 .SECONDARY:
+
+-include $(OBJS:.o=.d)

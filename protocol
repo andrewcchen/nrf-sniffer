@@ -1,0 +1,10 @@
+
+
+output: [8 byte header] [n byte ble packet]
+
+header: [4 byte timestamp] [1 byte flags] [1 byte channel id] [2 byte RFU]
+
+                              LSB <--> MSB
+flags: [1 bit crc match] [7 bit RFU]
+
+

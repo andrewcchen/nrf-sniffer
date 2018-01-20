@@ -42,12 +42,13 @@ def read_bytes(stream, count):
 
 def read_packet(stream):
     # Packet format:
-    # [4 byte timestamp] [1 byte S0] [1 byte length] [n byte data]
+    # [4 byte timestamp] [1 byte flags] [1 byte channel id] [2 bytes RFU]
+    # [1 byte S0] [1 byte length] [n byte data]
     
-    hdr = read_bytes(stream, 6)
-    timestamp, s0, length = struct.unpack("<LBB", hdr)
+    hdr = read_bytes(stream, 10)
+    ts, flags, chn, s0, length = struct.unpack("<LBBxxBB", hdr)
     data = read_bytes(stream, length)
-    return (timestamp, s0, length, data)
+    return (ts, flags, chn, s0, length, data)
 
 
 def main():
@@ -58,8 +59,15 @@ def main():
     stream = open(serial_port, "rb", buffering=0)
     
     while True:
-        t, s0, l, data = read_packet(stream)
-        print("{:d}.{:06d}: {:02x} {:02x}".format(t//1000000, t%1000000, s0, l), end="")
+        t, flags, chn, s0, l, data = read_packet(stream)
+        print("{:d}.{:06d}: ".format(t//1000000, t%1000000), end="")
+        print("ch{:d} ".format(chn), end="")
+        if (flags & 1) == 1:
+            crc = "crcok  "
+        else:
+            crc = "crcFAIL"
+        print(crc + ": ", end="")
+        print("{:02x} {:02x}".format(s0, l), end="")
         for x in data:
             print(" {:02x}".format(x), end="")
         print("\n", end="")

@@ -32,8 +32,31 @@
 
 #include "nrf51/nrf51.h"
 
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
+#include "uart_interface.h"
+#include "ble_ll.h"
+#include "config.h"
+
+
+/*
+ * We will operate in two disctint modes
+ *
+ * 1. Listen to advertising
+ * 
+ * In this mode we hop channels 37,38,39 every x seconds.
+ * Optionally, we can match on advertiser address, in which case we will hop
+ * onto the next channel 300us after the last packet relating to the advertiser
+ * we are interested in was recieved.
+ *
+ * 2. Listen to data
+ *
+ * TODO
+ *
+ */
+
+/*
+ * TODO have a configuration interface to configure from the PC
+ * stuff like selected device address and adv chn hopping frequency
+ */
 
 static void clock_setup(void) {
 	NRF_CLOCK->XTALFREQ = CLOCK_XTALFREQ_XTALFREQ_16MHz;
@@ -50,34 +73,44 @@ static void clock_setup(void) {
 	NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
 }
 
-static inline void uart_putchar(uint8_t c) {
-	while (NRF_UART0->EVENTS_TXDRDY == 0);
-	NRF_UART0->EVENTS_TXDRDY = 0;
-	NRF_UART0->TXD = c;
-}
+//static inline void uart_putchar(uint8_t c) {
+//	while (NRF_UART0->EVENTS_TXDRDY == 0);
+//	NRF_UART0->EVENTS_TXDRDY = 0;
+//	NRF_UART0->TXD = c;
+//}
 
-static void uart_setup(void) {
-	NRF_GPIO->OUTSET = 1 << UART_TX_PIN;
-	NRF_GPIO->PIN_CNF[UART_TX_PIN] =
-		GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos |
-		GPIO_PIN_CNF_DRIVE_H0H1 << GPIO_PIN_CNF_DRIVE_Pos;
+//static void uart_setup(void) {
+//	NRF_GPIO->OUTSET = 1 << UART_TX_PIN;
+//	NRF_GPIO->PIN_CNF[UART_TX_PIN] =
+//		GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos |
+//		GPIO_PIN_CNF_DRIVE_H0H1 << GPIO_PIN_CNF_DRIVE_Pos;
+//
+//	NRF_GPIO->PIN_CNF[UART_RX_PIN] =
+//		GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos |
+//		GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos;
+//
+//	NRF_UART0->PSELTXD = UART_TX_PIN;
+//	NRF_UART0->PSELRXD = UART_RX_PIN;
+//	NRF_UART0->BAUDRATE = UART_BAUDRATE_BAUDRATE_Baud1M;
+//	NRF_UART0->ENABLE = UART_ENABLE_ENABLE_Enabled;
+//	NRF_UART0->TASKS_STARTTX = 1;
+//	NRF_UART0->TXD = 0;
+//	uart_putchar(0);
+//	uart_putchar(0);
+//	uart_putchar(0);
+//	uart_putchar(0);
+//	uart_putchar(0);
+//}
 
-	NRF_GPIO->PIN_CNF[UART_RX_PIN] =
-		GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos |
-		GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos;
 
-	NRF_UART0->PSELTXD = UART_TX_PIN;
-	NRF_UART0->PSELRXD = UART_RX_PIN;
-	NRF_UART0->BAUDRATE = UART_BAUDRATE_BAUDRATE_Baud1M;
-	NRF_UART0->ENABLE = UART_ENABLE_ENABLE_Enabled;
-	NRF_UART0->TASKS_STARTTX = 1;
-	NRF_UART0->TXD = 0;
-	uart_putchar(0);
-	uart_putchar(0);
-	uart_putchar(0);
-	uart_putchar(0);
-	uart_putchar(0);
-}
+/*
+ * TIMER0 is our 32bit system elasped microseconds timer
+ * CC{0] is used as a general interrupt trigger
+ * CC[1] is used as an event trigger to disable radio and hop channel
+ * CC[2] is used as a capture for last packet recieved time
+ * CC[3] is used as a general timer readout
+ *
+ */
 
 static void timer_setup(void) {
 	NRF_TIMER0->MODE = TIMER_MODE_MODE_Timer;
@@ -87,8 +120,13 @@ static void timer_setup(void) {
 }
 
 static inline uint32_t timer_get(void) {
-	NRF_TIMER0->TASKS_CAPTURE[1] = 1;
-	return NRF_TIMER0->CC[1];
+	NRF_TIMER0->TASKS_CAPTURE[3] = 1;
+	return NRF_TIMER0->CC[3];
+}
+
+static void ppi_setup(void) {
+	NRF_PPI->CHENSET = (1 << 22)  // TIMER0 COMPARE[1] -> RADIO DISABLE
+	                 | (1 << 27); // RADIO END -> TIMER0 CAPTURE[2]
 }
 
 static void radio_setup(void) {
@@ -119,7 +157,9 @@ static void radio_setup(void) {
 	}
 
 	NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
-	NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
+	NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk
+	                    | RADIO_INTENSET_DISABLED_Msk
+	                    | RADIO_INTENSET_ADDRESS_Msk;
 	NVIC_SetPriority(RADIO_IRQn, 0 << 5);
 	NVIC_EnableIRQ(RADIO_IRQn);
 
@@ -127,53 +167,81 @@ static void radio_setup(void) {
 	NRF_RADIO->BASE0 = 0x89BED600;
 	NRF_RADIO->RXADDRESSES = 1 << 0;
 
-	NRF_RADIO->FREQUENCY = 2;
-	NRF_RADIO->DATAWHITEIV = 37;
 	NRF_RADIO->CRCINIT = 0x555555;
 }
 
 #define BUF_COUNT 32
 static volatile size_t tail;
-static volatile uint32_t buf[BUF_COUNT][65];
+static volatile uint32_t buf[BUF_COUNT][66];
+static volatile int current_channel;
 
 int main(void) {
 	clock_setup();
 	uart_setup();
 	timer_setup();
+	ppi_setup();
 	radio_setup();
+
+	NRF_RADIO->FREQUENCY = 2;
+	NRF_RADIO->DATAWHITEIV = 37;
+	current_channel = 37;
 	
-	NRF_RADIO->PACKETPTR = (uint32_t)(&buf[tail][1]);
+	NRF_RADIO->PACKETPTR = (uint32_t)
+		((struct uart_output_packet *) buf[tail])->pdu;
 	NRF_RADIO->TASKS_RXEN = 1;
 
 	size_t head = 0;
 
 	while (1) {
 		if (head != tail) {
-			uint8_t *ptr = (uint8_t *)buf[head];
-			size_t len = ptr[5] + 6;
-			for (size_t i = 0; i < len; i++) {
-				uart_putchar(ptr[i]);
-			}
+			uint8_t *ptr = (uint8_t *) buf[head];
+			size_t len = 10 + ptr[9];
+			uart_write(ptr, len);
 			head = (head + 1) % BUF_COUNT;
 		}
 	}
 }
 
 void RADIO_IRQHandler(void);
-
 void RADIO_IRQHandler(void) {
-	NRF_RADIO->EVENTS_END = 0;
+	if (NRF_RADIO->EVENTS_ADDRESS) {
+		NRF_RADIO->EVENTS_ADDRESS = 0;
+		NRF_TIMER0->CC[1] = 0;
+	}
 
-	if (NRF_RADIO->CRCSTATUS != 0) {
+	if (NRF_RADIO->EVENTS_END) {
+		NRF_RADIO->EVENTS_END = 0;
+
 		int oldtail = tail;
 		int newtail = (oldtail + 1) % BUF_COUNT;
-
-		NRF_RADIO->PACKETPTR = (uint32_t)(&buf[newtail][1]);
-		NRF_RADIO->TASKS_START = 1;
-
-		buf[oldtail][0] = timer_get();
 		tail = newtail;
-	} else {
-		NRF_RADIO->TASKS_START = 1;
+
+		struct uart_output_packet *packet = (void *) buf[oldtail];
+		packet->timestamp = NRF_TIMER0->CC[2];
+		packet->flags.crc_match = NRF_RADIO->CRCSTATUS;
+		packet->channel_id = current_channel;
+
+		NRF_TIMER0->CC[1] = packet->timestamp + 300;
+
+		NRF_RADIO->PACKETPTR = (uint32_t)
+			((struct uart_output_packet *) buf[newtail])->pdu;
+		if (NRF_RADIO->STATE == RADIO_STATE_STATE_RxIdle)
+			NRF_RADIO->TASKS_START = 1;
+	}
+
+	if (NRF_RADIO->EVENTS_DISABLED) {
+		NRF_RADIO->EVENTS_DISABLED = 0;
+
+		int next_channel = (current_channel - 37 + 1) % 3 + 37;
+		int freq;
+		if (next_channel == 37) freq = 2;
+		if (next_channel == 38) freq = 26;
+		if (next_channel == 39) freq = 80;
+		
+		NRF_RADIO->FREQUENCY = freq;
+		NRF_RADIO->DATAWHITEIV = next_channel;
+
+		NRF_RADIO->TASKS_RXEN = 1;
+		current_channel = next_channel;
 	}
 }
