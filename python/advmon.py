@@ -61,7 +61,7 @@ def main():
     while True:
         t, flags, chn, s0, l, data = read_packet(stream)
         print("{:d}.{:06d}: ".format(t//1000000, t%1000000), end="")
-        print("ch{:d} ".format(chn), end="")
+        print("ch{:02d} ".format(chn), end="")
         if (flags & 1) == 1:
             crc = "crcok  "
         else:

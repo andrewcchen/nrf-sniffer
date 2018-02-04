@@ -34,6 +34,8 @@
 
 #include "uart_interface.h"
 #include "ble_ll.h"
+#include "ble_phy.h"
+#include "chsel.h"
 #include "config.h"
 
 
@@ -58,6 +60,17 @@
  * stuff like selected device address and adv chn hopping frequency
  */
 
+#define BUF_COUNT 32
+static volatile size_t tail;
+static volatile uint32_t buf[BUF_COUNT][66];
+static volatile int current_channel;
+
+enum _capture_mode_t {
+	CAPTURE_STOPPED, CAPTURE_ADVERTISING, CAPTURE_DATA
+};
+static volatile enum _capture_mode_t capture_mode;
+
+
 static void clock_setup(void) {
 	NRF_CLOCK->XTALFREQ = CLOCK_XTALFREQ_XTALFREQ_16MHz;
 
@@ -72,45 +85,6 @@ static void clock_setup(void) {
 	while (NRF_CLOCK->EVENTS_LFCLKSTARTED == 0);
 	NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
 }
-
-//static inline void uart_putchar(uint8_t c) {
-//	while (NRF_UART0->EVENTS_TXDRDY == 0);
-//	NRF_UART0->EVENTS_TXDRDY = 0;
-//	NRF_UART0->TXD = c;
-//}
-
-//static void uart_setup(void) {
-//	NRF_GPIO->OUTSET = 1 << UART_TX_PIN;
-//	NRF_GPIO->PIN_CNF[UART_TX_PIN] =
-//		GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos |
-//		GPIO_PIN_CNF_DRIVE_H0H1 << GPIO_PIN_CNF_DRIVE_Pos;
-//
-//	NRF_GPIO->PIN_CNF[UART_RX_PIN] =
-//		GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos |
-//		GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos;
-//
-//	NRF_UART0->PSELTXD = UART_TX_PIN;
-//	NRF_UART0->PSELRXD = UART_RX_PIN;
-//	NRF_UART0->BAUDRATE = UART_BAUDRATE_BAUDRATE_Baud1M;
-//	NRF_UART0->ENABLE = UART_ENABLE_ENABLE_Enabled;
-//	NRF_UART0->TASKS_STARTTX = 1;
-//	NRF_UART0->TXD = 0;
-//	uart_putchar(0);
-//	uart_putchar(0);
-//	uart_putchar(0);
-//	uart_putchar(0);
-//	uart_putchar(0);
-//}
-
-
-/*
- * TIMER0 is our 32bit system elasped microseconds timer
- * CC{0] is used as a general interrupt trigger
- * CC[1] is used as an event trigger to disable radio and hop channel
- * CC[2] is used as a capture for last packet recieved time
- * CC[3] is used as a general timer readout
- *
- */
 
 static void timer_setup(void) {
 	NRF_TIMER0->MODE = TIMER_MODE_MODE_Timer;
@@ -170,11 +144,6 @@ static void radio_setup(void) {
 	NRF_RADIO->CRCINIT = 0x555555;
 }
 
-#define BUF_COUNT 32
-static volatile size_t tail;
-static volatile uint32_t buf[BUF_COUNT][66];
-static volatile int current_channel;
-
 int main(void) {
 	clock_setup();
 	uart_setup();
@@ -185,6 +154,7 @@ int main(void) {
 	NRF_RADIO->FREQUENCY = 2;
 	NRF_RADIO->DATAWHITEIV = 37;
 	current_channel = 37;
+	capture_mode = CAPTURE_ADVERTISING;
 	
 	NRF_RADIO->PACKETPTR = (uint32_t)
 		((struct uart_output_packet *) buf[tail])->pdu;
@@ -202,9 +172,65 @@ int main(void) {
 	}
 }
 
+struct connection_info {
+	unsigned int conn_interval_us;
+	unsigned int last_window;
+	struct ble_chsel1 chsel1;
+} conn_info;
+
+static inline void switch_channel(int channel) {
+	NRF_RADIO->DATAWHITEIV = channel;
+	NRF_RADIO->FREQUENCY = ble_chn_freq[channel];
+}
+
+static void enter_capture_data_mode(struct ble_connect_req *conn_req, uint32_t ts) {
+	NVIC_DisableIRQ(RADIO_IRQn);
+	NRF_RADIO->TASKS_DISABLE = 1;
+
+	conn_info.conn_interval_us = conn_req->interval * 1250;
+	ble_chsel1_init(&conn_info.chsel1, conn_req->hop, conn_req->channel_map);
+	int channel = ble_chsel1_next_chn(&conn_info.chsel1);
+
+	NRF_RADIO->PREFIX0 = conn_req->access_addr >> 24;
+	NRF_RADIO->BASE0 = conn_req->access_addr << 8;
+	NRF_RADIO->RXADDRESSES = 1 << 0;
+
+	NRF_RADIO->CRCINIT = conn_req->crc_init;
+	switch_channel(channel);
+	current_channel = channel;
+
+	conn_info.last_window = ts
+		+ 1250
+		+ conn_req->win_offset * 1250
+		+ conn_info.conn_interval_us;
+
+	// timer for disabling radio and changing freq at end of the conn interval
+	NRF_TIMER0->CC[1] = conn_info.last_window - 1000; // TODO -150?
+
+	capture_mode = CAPTURE_DATA;
+
+	// do we need this? why do we need this?
+	NRF_RADIO->PACKETPTR = (uint32_t)
+		((struct uart_output_packet *) buf[tail])->pdu;
+
+	while (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled);
+
+	NRF_RADIO->INTENCLR = 0xFFFFFFFF;
+	NRF_RADIO->EVENTS_DISABLED = 0;
+	NRF_RADIO->EVENTS_END = 0;
+	NRF_RADIO->EVENTS_ADDRESS = 0;
+	NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk
+	                    | RADIO_INTENSET_DISABLED_Msk;
+	                    //| RADIO_INTENSET_ADDRESS_Msk;
+	NVIC_ClearPendingIRQ(RADIO_IRQn);
+	NVIC_EnableIRQ(RADIO_IRQn);
+
+	NRF_RADIO->TASKS_RXEN = 1;
+}
+
 void RADIO_IRQHandler(void);
 void RADIO_IRQHandler(void) {
-	if (NRF_RADIO->EVENTS_ADDRESS) {
+	if (NRF_RADIO->EVENTS_ADDRESS && capture_mode == CAPTURE_ADVERTISING) {
 		NRF_RADIO->EVENTS_ADDRESS = 0;
 		NRF_TIMER0->CC[1] = 0;
 	}
@@ -221,7 +247,18 @@ void RADIO_IRQHandler(void) {
 		packet->flags.crc_match = NRF_RADIO->CRCSTATUS;
 		packet->channel_id = current_channel;
 
-		NRF_TIMER0->CC[1] = packet->timestamp + 300;
+		if (capture_mode == CAPTURE_ADVERTISING) {
+			struct ble_advertising_pdu *pdu = packet->pdu;
+			if (pdu->pdu_type == CONNECT_IND) {
+				enter_capture_data_mode(pdu->payload, packet->timestamp);
+				return;
+			} else {
+				NRF_TIMER0->CC[1] = packet->timestamp + 300;
+			}
+
+		} else if (capture_mode == CAPTURE_DATA) {
+			// TODO
+		}
 
 		NRF_RADIO->PACKETPTR = (uint32_t)
 			((struct uart_output_packet *) buf[newtail])->pdu;
@@ -232,16 +269,18 @@ void RADIO_IRQHandler(void) {
 	if (NRF_RADIO->EVENTS_DISABLED) {
 		NRF_RADIO->EVENTS_DISABLED = 0;
 
-		int next_channel = (current_channel - 37 + 1) % 3 + 37;
-		int freq;
-		if (next_channel == 37) freq = 2;
-		if (next_channel == 38) freq = 26;
-		if (next_channel == 39) freq = 80;
-		
-		NRF_RADIO->FREQUENCY = freq;
-		NRF_RADIO->DATAWHITEIV = next_channel;
+		if (capture_mode == CAPTURE_ADVERTISING) {
+			int next_channel = (current_channel - 37 + 1) % 3 + 37;
+			switch_channel(next_channel);
+			current_channel = next_channel;
+		} else { //else if (capture_mode == CAPTURE_DATA) {
+			int next_channel = ble_chsel1_next_chn(&conn_info.chsel1);
+			switch_channel(next_channel);
+			current_channel = next_channel;
+			conn_info.last_window += conn_info.conn_interval_us;
+			NRF_TIMER0->CC[1] = conn_info.last_window - 1000; // TODO -150?
+		}
 
 		NRF_RADIO->TASKS_RXEN = 1;
-		current_channel = next_channel;
 	}
 }
